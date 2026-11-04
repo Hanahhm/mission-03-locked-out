@@ -1,7 +1,7 @@
 # Mission 3 — "Locked out" · Incident Case File
 
 **Analyst:** Hanah Marroun
-**Date:** 2026-10-30
+**Date:** 2026-10-30 (revised 2026-11-04 after coach feedback)
 **Environment:** BeCode Hamilton lab
 **Target workstation:** `WKS-L62.hamilton.corp` (`10.50.0.62`), seat 62
 **Domain controller:** `DC01` (`10.50.0.10`), domain `hamilton.corp`
@@ -9,177 +9,89 @@
 
 ---
 
-## 1. Executive summary (for a manager)
+## 1. Executive summary — for a manager
 
-I was locked out of my own workstation and of my security monitoring: both my normal login and my monitoring login had been changed. The workstation was still reachable on the network. By taking inventory of what the machine still exposed, I found a file-sharing service (SMB) open to **anonymous access**. Inside a shared folder, a training account's credentials had been left in a readable text file. That small account was enough to read a domain configuration area (SYSVOL) where an administrative password had been stored in a reversible, publicly-documented format (GPP cpassword). Recovering the password for **my own workstation** gave me back administrative access.
+I was locked out of my own workstation and of my security monitoring: both logins had been changed, but the machine was still reachable on the network. By taking inventory of what it still exposed, I found a file-sharing service (SMB) open to **anonymous access**. A shared folder held a training account's password in a readable file; that small account was enough to read a domain configuration area (SYSVOL) where an administrative password had been stored in a **reversible, publicly-documented format** (GPP cpassword). Recovering the password for my own workstation gave me back administrative access.
 
-Once back in, I recovered three things left on the desktop: the **proof** of access, the **new monitoring login** (which I rotated immediately), and a **staged set of employee data** the intruder had prepared to steal. That staged data is a **personal-data breach** and triggers notification duties under NIS2 and GDPR (see §7).
+Once back in, I recovered three things left on the desktop: the **proof** of access, the **new monitoring login** (which I rotated immediately), and a **staged set of employee data** the intruder had prepared to steal.
 
-**Severity: Critical.** This is not limited to a single workstation. The GPP `cpassword` lived in SYSVOL as **one `Groups.xml` per seat**, and **any domain user can read SYSVOL** — so one low-privilege foothold exposes the reversible local-administrator password of **every workstation in the domain**, not just mine. That is domain-wide administrative exposure, obtained with a key Microsoft itself published (MS14-025), and on top of it a set of personal data was already staged for exfiltration. The blast radius (every seat) and the trivial, reliable exploitation put this at the top of the scale. There is still no evidence the data actually left the network, but that does not lower the rating given how many hosts the same weakness exposes. Every weakness used was an avoidable misconfiguration with a cheap fix (see §6).
-
----
-
-## 2. Timeline (for a technician)
-
-Sentinel times are in UTC (local time zone is UTC+1).
-
-| # | Stage | Action / observation | Evidence |
-|---|-------|----------------------|----------|
-| 0 | Anonymous access to the share (the open door) | `ANONYMOUS LOGON` (SID `S-1-5-7`), LogonType 3 (Network), NTLM, from `10.50.0.1` | SecurityEvent 4624, ~27-10-2026 15:35 UTC |
-| 1 | Recon | Port scan of own workstation | `nmap -p- -sV 10.50.0.62` → 445/tcp SMB (`microsoft-ds`), 3389/tcp RDP (`ms-wbt-server`) |
-| 1b | Recon detail | SMB fingerprint | `nmap -sC -sV -p 445,3389 10.50.0.62` → SMB 3.1.1, *"Message signing enabled but not required"* |
-| 2 | First foothold | Anonymous (guest) SMB access to the `Public` share | `smbclient //10.50.0.62/Public -N` → `account-access.txt` |
-| 2b | Credential in file | File held a temporary training account + flag | user `training01`; flag `HAM{anon_smb_seat62}` |
-| 3 | Reach the secret store | Used `training01` to read SYSVOL on the DC | `nxc smb 10.50.0.10 -u training01 -p '***' -M gpp_password` |
-| 3b | GPP cpassword | Found a stored password in a per-seat `Groups.xml` | `svc_deploy` ("Legacy deployment account", `RID_ADMIN`), **local** account |
-| 3c | Decrypt (my seat) | Reversed the cpassword for **seat62** with Microsoft's **published** AES key | GPO `{824455D7-…}`; flag `HAM{gpp_cpassword_seat62}` |
-| 4 | Walk back in | RDP to own workstation with the recovered credential | `xfreerdp3 /v:10.50.0.62 /u:svc_deploy /sec:tls …` → banner `HAM{admin_rdp_seat62}` |
-| 4b | Failed logons (lock-out / recovery) | Repeated `svc_deploy` logon failures, then success | SecurityEvent 4625 then 4624, 29-10-2026 ~14:50→15:52 UTC |
-| 5 | Proof + loot | Three items on the desktop | `proof_of_access.txt`, `monitoring-access.txt`, `staging\employees.csv` |
-| 5b | Rotate | Signed into Sentinel with the recovered login, then changed its password | — |
+**The single most important risk this exposed:** the reversible admin password was not a one-off. SYSVOL held **one copy per workstation**, readable by **any domain user** — so the same weakness exposes the local-administrator password of **every machine in the domain**, not just mine. Combined with a personal-data set already staged for exfiltration, this is a **Critical** finding (see §5).
 
 ---
 
-## 3. Technical walkthrough (step by step)
+## 2. Technical narrative — for a technician
 
-### Step 1 — Reconnaissance
-From Kali, over Tailscale:
-```bash
-nmap -p- -sV 10.50.0.62
-```
-Only **445/tcp (SMB)** and **3389/tcp (RDP)** open. RDP is the screen service I already knew; the thread to pull is **SMB (445)**.
-```bash
-nmap -sC -sV -p 445,3389 10.50.0.62
-```
-Notable: SMB 3.1.1 with *"Message signing enabled but not required"* (a weakness — see §6).
+- **Stage 1 — seeing what was still exposed.** With my normal access revoked, I inventoried the services the workstation still offered from the network. Only two were open: **SMB (445)** and **RDP (3389)**. RDP is the screen service I already knew, so the thread to pull was SMB. The SMB fingerprint also showed **message signing enabled but not required** — noted as a weakness, though not used in this chain (see §4).
 
-### Step 2 — First foothold (anonymous SMB)
-SMB allowed a **guest** session (no credentials):
-```bash
-smbclient -L 10.50.0.62 -N          # listed shares; "Public" stood out
-smbclient //10.50.0.62/Public -N    # entered as guest
-smb: \> get account-access.txt
-```
-`account-access.txt` held a **temporary training account** (`training01`, "to be rotated") and the flag **`HAM{anon_smb_seat62}`**. Credentials must never sit in a readable file on an anonymously-accessible share.
+- **Stage 2 — getting a first foothold.** SMB allowed an **anonymous (guest) session** with no credentials. Inside a `Public` share, a readable file held the credentials of a **temporary training account** (`training01`, marked "to be rotated"). Credentials must never sit in a readable file on an anonymously-accessible share. *My Sentinel recorded an `ANONYMOUS LOGON` (SID `S-1-5-7`, LogonType 3, NTLM) from `10.50.0.1`, ~27-10 15:35 UTC (SecurityEvent 4624).* **Attribution caveat:** I cannot prove this event was the intruder rather than my own anonymous test — `10.50.0.1` is the lab gateway that **every actor is NAT-ed behind**, mine included. The only discriminator is timing: it predates my own recovery work (29–30-10), so it is consistent with the original intrusion, but I treat it as **probable**, not proven.
 
-### Step 3 — Finding the real key (GPP cpassword)
-`training01` is low-privileged, but any domain account can read **SYSVOL** on the DC, where Group Policy lives:
-```bash
-nxc smb 10.50.0.10 -u training01 -p '***' -M gpp_password
-```
-SYSVOL held **one `Groups.xml` per seat**, each with a GPP **`cpassword`** for a local account **`svc_deploy`** (`RID_ADMIN`). The automated tool choked on the base64 (it was **URL-safe**), so I pulled the `Groups.xml` for **my own seat (62)** — GPO `{824455D7-2CBD-4589-A9B3-871AB5BA16C6}` — and decrypted it manually:
-- URL-safe base64 → standard (`-`→`+`, `_`→`/`), pad to a multiple of 4
-- AES-CBC with the AES key **Microsoft published** in its own documentation (MS14-025)
-- decode UTF-16LE, strip PKCS7 padding
+- **Stage 3 — finding the real key.** The training account was low-privileged, but **any domain account can read SYSVOL** on the domain controller, where Group Policy lives. SYSVOL held a **GPP `cpassword`** — a password encrypted with an **AES key Microsoft itself published** (MS14-025), so it is reversible by anyone. Critically, there was **one `Groups.xml` per seat**, each with the reversible password of a local administrator account (`svc_deploy`). I decrypted the one for **my own seat (62)** and recovered its password. *This step happened on the DC, off my workstation, so it is reconstructed from my own actions rather than from my SIEM.* **Lesson learned:** I first decrypted another seat's file and its password was rejected by my machine — SYSVOL has one per workstation, and `svc_deploy` is a **local** account, so you must use your own seat's copy.
 
-This revealed `svc_deploy`'s password **for my workstation**. (Flag for this stage: `HAM{gpp_cpassword_seat62}`.)
+- **Stage 4 — walking back in.** I used the recovered local-admin credential to RDP back into my workstation. The connection first failed under NLA; the fix was the client's security mode (forcing TLS), not the credential. This landed me on my own desktop as a local administrator. *My Sentinel shows the classic shape of this reprise: repeated `svc_deploy` logon failures followed by a success (SecurityEvent 4625 → 4624, 29-10). Note: many of those failures are my own recovery attempts with the wrong seat's password — an honest read of the data.*
 
-**Lesson learned (the useful part):** I first decrypted **another seat's** `Groups.xml` and its password was rejected by my machine. SYSVOL has one per workstation — you must use **your own seat's**. Also, `svc_deploy` is a **local** account, so Kerberos/SAMR password operations against the DC do not apply, and the RDP error `PASSWORD_CERTAINLY_EXPIRED` actually meant *the password I was sending did not match this host* — not that it was expired.
+- **Stage 5 — taking my proof and seeing what they were after.** Three items sat on the desktop: the **proof of access**; the **new monitoring (Sentinel) login**, which I signed into once and then **rotated immediately** per the first-reflex rule; and a **staged employee dataset** the intruder had gathered and parked, ready to exfiltrate (assessed as a data breach in §5).
 
-### Step 4 — Walking back in (RDP)
-RDP first refused over NLA. The fix was the client's security-mode, not the credential — forcing TLS security:
-```bash
-xfreerdp3 /v:10.50.0.62 /u:svc_deploy /sec:tls /cert:ignore /dynamic-resolution
-```
-This landed me on my own desktop as a local administrator. Banner flag: **`HAM{admin_rdp_seat62}`**.
-
-### Step 5 — Proof, monitoring key, and staged data
-Three items on the desktop that do not belong:
-1. **`proof_of_access.txt`** → flag **`HAM{desktop_proof_seat62}`** (submitted in CTFd — *Proof on the desktop*).
-2. **`monitoring-access.txt`** → the new Sentinel login (my BeCode account + a new password). Per the first-reflex rule, I **signed in once and then rotated the password**.
-3. **`staging\employees.csv`** → a staged dataset the intruder had prepared to exfiltrate (see §7).
+**On monitoring coverage.** Process-creation auditing (**Event 4688**) is enabled on this workstation and has been since Mission 2, so host-level process and command execution **is** visible in my SIEM — there is no logging blind spot here. The only steps outside my view are those that happened on the **domain controller / SYSVOL**, which is off my workstation. All on-host authentication came over the gateway `10.50.0.1` using **NTLM**, not Kerberos.
 
 ---
 
-## 4. Reconstruction from my own Sentinel (blue)
+## 3. MITRE ATT&CK mapping
 
-Workspace `log-sentinel-lab`, table `SecurityEvent`. My workstation's monitoring only records what happens **on my workstation**, so the DC/SYSVOL steps are not here — that is expected.
-
-**a) The anonymous access to my share (the open door):**
-```kql
-SecurityEvent
-| where EventID == 4624 and Account contains "ANONYMOUS"
-| order by TimeGenerated desc
-```
-Result: an `ANONYMOUS LOGON` (TargetUserSid **`S-1-5-7`**, TargetDomainName `WORKGROUP`), **LogonType 3 (Network)**, **NTLM** (`NtLmSsp`), from **`10.50.0.1`** (lab gateway), ~27-10 15:35 UTC. This is a login with no identity — exactly what anonymous SMB access to the share looks like.
-
-**Whose anonymous logon is this?** Honestly, I cannot prove it was the intruder from the source address alone. It comes from `10.50.0.1`, the lab gateway — the **same address every bit of my own traffic is NATed through**, including my own `smbclient -N` test against the share. Source IP cannot separate the attacker from me here. The only discriminator is **timing**: this event is dated ~27-10, *before* my own recovery work on 29–30-10, which is consistent with the original intrusion rather than my testing. So I treat it as the **probable** open door, not a proven one, and flag the limitation that the lab hides every actor behind one address.
-
-**b) The failed logons (being locked out / getting back):**
-```kql
-SecurityEvent
-| where EventID == 4625
-| project TimeGenerated, Account, LogonType, IpAddress, WorkstationName, FailureReason
-| order by TimeGenerated desc
-```
-Result: repeated `svc_deploy` failures on `WKS-L62`, LogonType 10 (RDP) and 3 (Network), from `10.50.0.1`, FailureReason `%%2313` = *"unknown user name or bad password."* (Honest note: many of these are my own recovery attempts with the wrong seat's password — the logs show the classic *many failures → eventual success* shape.)
-
-**c) The successful logon (my way back in):**
-```kql
-SecurityEvent
-| where EventID == 4624 and Account has "svc_deploy"
-| order by TimeGenerated desc
-```
-Result: `WKS-L62\svc_deploy` logged on successfully, first success 29-10 ~15:52 UTC, AuthenticationPackage **NTLM**/Negotiate, from `10.50.0.1`.
-
-**What my monitoring did and did not cover.** Sentinel recorded the anonymous access, the failed logons and the successful logon. I also verified that **process-creation auditing (Event 4688) is enabled** on this workstation and has been since Mission 2: querying `SecurityEvent | where EventID == 4688` returns the host's process activity, and the `svc_deploy` RDP session on 29-10 appears in it (e.g. `explorer.exe` and the usual first-logon processes at ~17:10 UTC). So process and command execution on the host **is** visible — there is no logging blind spot here. The real limit of my view is **scope, not logging**: everything that happened on the **domain controller / SYSVOL** took place off my workstation, so it is not in my SIEM. All on-host traffic came over the gateway `10.50.0.1` using **NTLM**, not Kerberos.
+| Stage | Tactic | Technique (ID + name) | What I did | Where I can prove it |
+|---|---|---|---|---|
+| 1 — exposure | Discovery | **T1046** Network Service Discovery | Inventoried exposed services; found SMB + RDP open | Reconstructed from my own actions (scan ran from Kali) |
+| 2 — foothold | Discovery / Credential Access | **T1135** Network Share Discovery; **T1552.001** Unsecured Credentials: Credentials In Files | Anonymous SMB into `Public`; read a training account from a file | SecurityEvent 4624 (`ANONYMOUS LOGON`) — attribution caveat, §2 |
+| 3 — the key | Credential Access | **T1552.006** Unsecured Credentials: Group Policy Preferences | Read SYSVOL; decrypted my seat's reversible GPP cpassword | Reconstructed from my own actions (SYSVOL read on the DC) |
+| 4 — reprise | Initial Access / Lateral Movement | **T1078.003** Valid Accounts: Local Accounts; **T1021.001** Remote Services: RDP | RDP back in with the recovered local-admin credential | SecurityEvent 4625 → 4624 (`svc_deploy`, 29-10) |
+| 5 — proof + staged data | Collection | **T1074** Data Staged; **T1005** Data from Local System | Recovered proof + monitoring login; found staged employee data | Files recovered on the host; staging observed on disk |
 
 ---
 
-## 5. MITRE ATT&CK mapping
+## 4. Control gaps & remediation
 
-| Stage | Technique | ID |
-|-------|-----------|----|
-| Port scan of the workstation | Network Service Discovery | **T1046** |
-| Anonymous access to SMB share | Network Share Discovery | **T1135** |
-| Credentials left in a readable file | Unsecured Credentials: Credentials In Files | **T1552.001** |
-| GPP cpassword in SYSVOL | Unsecured Credentials: Group Policy Preferences | **T1552.006** |
-| Using the recovered local admin account | Valid Accounts (Local) | **T1078.003** |
-| RDP back into the workstation | Remote Services: Remote Desktop Protocol | **T1021.001** |
-| Intruder's staged employee data | Data Staged | **T1074** |
+*One row per weakness actually used in this chain.*
 
----
+| Weakness exploited | Why it worked | Missing control + fix | ISO 27001:2022 Annex A | NIS2 / CyFun |
+|---|---|---|---|---|
+| Anonymous/guest SMB access to a share | Guest sessions were allowed, so no identity was needed | Disable guest/anonymous SMB; restrict share permissions to named groups | A.5.15 Access control; A.8.3 Information access restriction | Access control (Art. 21.2.i) |
+| Credentials stored in a readable file | A password sat in plain text on an open share | Never store passwords in files; use a secrets vault | A.5.17 Authentication information; A.8.3 | Secure credential handling |
+| GPP `cpassword` in SYSVOL (reversible) | Encrypted with a key Microsoft published; readable by any domain user; one per seat | Remove all GPP cpassword (MS14-025); deploy **LAPS** for local-admin passwords | A.8.24 Use of cryptography; A.5.17 | Cryptography (Art. 21.2.h) |
+| Legacy privileged **local** account with a static secret | A reusable local-admin secret existed on every seat | Remove legacy admin accounts; rotate & vault service-account secrets; least privilege | A.8.2 Privileged access rights; A.5.16 Identity management | Identity & access management |
+| Employee data staged, no egress control | Data could be gathered and parked ready to leave | DLP + egress filtering; restrict who can read the data at rest | A.8.12 Data leakage prevention; A.5.14 Information transfer | Incident handling & data protection |
 
-## 6. Control gaps and fixes
-
-| Weakness used | Missing control (ISO 27001:2022 Annex A) | NIS2 / CyFun | Fix |
-|---------------|------------------------------------------|--------------|-----|
-| Anonymous/guest SMB access to a share | A.5.15 Access control; A.8.3 Information access restriction | Access control (NIS2 Art. 21.2.i) | Disable guest/anonymous SMB; restrict share permissions to named groups |
-| Credentials stored in a readable file | A.5.17 Authentication information; A.8.3 | Secure credential handling | Never store passwords in files; use a secrets vault |
-| GPP `cpassword` in SYSVOL (reversible) | A.8.24 Use of cryptography; A.5.17 | Cryptography (NIS2 Art. 21.2.h) | Remove all GPP cpassword (MS14-025); deploy **LAPS** for local-admin passwords |
-| Legacy privileged local account with a static secret | A.8.2 Privileged access rights; A.5.16 Identity management | Identity & access management | Remove legacy admin accounts; rotate & vault service-account secrets |
-| Employee data staged for exfiltration | A.8.12 Data leakage prevention; A.5.14 Information transfer | Incident handling & data protection | DLP + egress filtering; restrict who can read the data at rest |
-
-**Other weaknesses observed (not part of this attack chain).** One finding is worth recording even though the intrusion did not rely on it:
-- **SMB signing enabled but not required** (seen in the nmap fingerprint, §2). It was not used in this chain, but it leaves the host open to SMB relay / man-in-the-middle attacks. Fix: enforce SMB signing as **required**, not merely enabled (ISO 27001 A.8.20 / A.8.21).
+**Other weaknesses observed (not part of this attack chain).** Worth recording even though the intrusion did not rely on it:
+- **SMB signing enabled but not required** (seen in the Stage 1 fingerprint). It leaves the host open to SMB relay / man-in-the-middle attacks. Fix: enforce SMB signing as **required**, not merely enabled (ISO 27001 A.8.20 / A.8.21).
 
 ---
 
-## 7. Data breach assessment
+## 5. Data breach assessment
 
-The intruder had **staged employee data ready to leave the network**: `staging\employees.csv`, marked `EXFIL-TEST-MARKER-M3`. It contained **4 employee records** with columns **employee_id, full_name, email, department, salary**. (The dataset is simulated lab data — `example.com` addresses — but is analysed here as if it were a real breach.)
+- **What was exposed.** A staged file (`staging\employees.csv`, marked `EXFIL-TEST-MARKER-M3`) with **4 employee records** — `employee_id`, `full_name`, `email`, `department`, `salary`. That is personal data (names, emails) combined with **salary** (sensitive HR/financial data). The dataset is simulated lab data (`example.com` addresses) but is analysed here as a real breach.
 
-- **What was exposed:** personal data (names, emails) plus **salary** (sensitive HR/financial data) for 4 employees.
-- **NIS2 notification duty:** report to the national CSIRT/competent authority — **early warning within 24 h**, **incident notification within 72 h**, final report within one month (NIS2 Art. 23). *Why it applies:* these duties attach when the organisation is an **essential or important entity** in a covered sector (in scope) **and** the incident is **"significant"** — i.e. capable of causing serious operational disruption or financial loss, or of affecting other parties. Domain-wide administrative exposure plus a staged personal-data set clears the "significant" threshold.
-- **GDPR notification duty:** notify the supervisory authority **within 72 h** of becoming aware (Art. 33), **and** notify the affected people without undue delay (Art. 34). *Why Art. 34 applies:* individual notification is required only when the breach is likely to be a **high risk to people's rights and freedoms**. Here the data combines identity (name, email) with **salary** (sensitive financial data), which enables targeted phishing, fraud and social engineering — a high risk — so the individuals, not just the authority, must be told.
-- **Control that should have stopped the data leaving:** Data Leakage Prevention / egress filtering (ISO 27001 A.8.12), plus access restriction at rest (A.8.3).
+- **Severity.** **Critical.** Who would be harmed and how: the 4 employees face a **high risk** — identity data plus salary enables targeted phishing, fraud and social engineering against them. Beyond this file, the GPP weakness that enabled the intrusion exposes **every workstation's local-admin password** to any domain user, so the blast radius is domain-wide, not a single host.
 
-There is evidence of **staging** (the file was gathered and ready), but no evidence in my workstation's logs of actual **exfiltration** leaving the network.
+- **Notification duty under NIS2.** Report to the national CSIRT/competent authority — **early warning within 24 h**, **incident notification within 72 h**, final report within one month (Art. 23). *Why it applies:* these duties attach when the organisation is an **essential or important entity** in a covered sector (in scope) **and** the incident is **"significant"** — capable of serious operational disruption or financial loss, or of affecting others. Domain-wide admin exposure plus a staged personal-data set clears the "significant" threshold.
 
----
+- **Obligations under GDPR.** Personal data was involved, so this triggers GDPR. Notify the supervisory authority **within 72 h** of becoming aware (Art. 33), **and** notify the affected individuals without undue delay (Art. 34). *Why Art. 34 applies:* individual notification is required when the breach is likely to be a **high risk to people's rights and freedoms** — met here because the data combines identity with salary, enabling fraud and targeted attacks.
 
-## 8. Stretch (optional)
-
-Not performed in this iteration. A second, independent way back into the machine (a different leftover or foothold) could be added here as an alternative route.
+- **Missing control.** The data should never have been collectable and parked with no egress control. Fix: **Data Leakage Prevention / egress filtering** (ISO 27001 A.8.12) plus **access restriction at rest** (A.8.3), so the data cannot be read in bulk or staged for exfiltration.
 
 ---
 
-## Appendix — CTFd flags (engine, not the hand-in)
+## 6. Stretch — alternative route (optional)
 
-| Challenge | Flag | Status |
-|-----------|------|--------|
-| First foothold | `HAM{anon_smb_seat62}` | submitted |
-| Privileged return | `HAM{admin_rdp_seat62}` | submitted |
-| Proof on the desktop | `HAM{desktop_proof_seat62}` | submitted |
-| The climax | `HAM{gpp_cpassword_seat62}` | submitted |
-| Recon | — | pending (optional) |
+Not performed in this iteration. A second, independent way back onto the machine (a different leftover credential or foothold) could be added here as an alternative route, described the same way as the main chain.
+
+---
+
+## Appendix — CTFd progress (status only, not the hand-in)
+
+| Challenge | Status |
+|-----------|--------|
+| First foothold | submitted |
+| Privileged return | submitted |
+| Proof on the desktop | submitted |
+| The climax | submitted |
+| Recon | pending |
+
+*(Flag values are deliberately not reproduced here — the report, not the flag, is the deliverable.)*
