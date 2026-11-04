@@ -15,7 +15,7 @@ I was locked out of my own workstation and of my security monitoring: both my no
 
 Once back in, I recovered three things left on the desktop: the **proof** of access, the **new monitoring login** (which I rotated immediately), and a **staged set of employee data** the intruder had prepared to steal. That staged data is a **personal-data breach** and triggers notification duties under NIS2 and GDPR (see §7).
 
-**Severity: High.** An attacker obtained administrative access to the workstation and had already staged a set of personal data (employee names, emails and salaries) ready for exfiltration; credentials were also left exposed in several locations. It is not rated Critical because the impact is limited to a single workstation and there is no evidence the data actually left the network. Every weakness used was an avoidable misconfiguration, and each has a cheap fix (see §6).
+**Severity: Critical.** This is not limited to a single workstation. The GPP `cpassword` lived in SYSVOL as **one `Groups.xml` per seat**, and **any domain user can read SYSVOL** — so one low-privilege foothold exposes the reversible local-administrator password of **every workstation in the domain**, not just mine. That is domain-wide administrative exposure, obtained with a key Microsoft itself published (MS14-025), and on top of it a set of personal data was already staged for exfiltration. The blast radius (every seat) and the trivial, reliable exploitation put this at the top of the scale. There is still no evidence the data actually left the network, but that does not lower the rating given how many hosts the same weakness exposes. Every weakness used was an avoidable misconfiguration with a cheap fix (see §6).
 
 ---
 
@@ -103,6 +103,8 @@ SecurityEvent
 ```
 Result: an `ANONYMOUS LOGON` (TargetUserSid **`S-1-5-7`**, TargetDomainName `WORKGROUP`), **LogonType 3 (Network)**, **NTLM** (`NtLmSsp`), from **`10.50.0.1`** (lab gateway), ~27-10 15:35 UTC. This is a login with no identity — exactly what anonymous SMB access to the share looks like.
 
+**Whose anonymous logon is this?** Honestly, I cannot prove it was the intruder from the source address alone. It comes from `10.50.0.1`, the lab gateway — the **same address every bit of my own traffic is NATed through**, including my own `smbclient -N` test against the share. Source IP cannot separate the attacker from me here. The only discriminator is **timing**: this event is dated ~27-10, *before* my own recovery work on 29–30-10, which is consistent with the original intrusion rather than my testing. So I treat it as the **probable** open door, not a proven one, and flag the limitation that the lab hides every actor behind one address.
+
 **b) The failed logons (being locked out / getting back):**
 ```kql
 SecurityEvent
@@ -120,7 +122,7 @@ SecurityEvent
 ```
 Result: `WKS-L62\svc_deploy` logged on successfully, first success 29-10 ~15:52 UTC, AuthenticationPackage **NTLM**/Negotiate, from `10.50.0.1`.
 
-**The gap (what my monitoring did NOT see):** Sentinel recorded the anonymous access, the failed logons and the successful logon, but **not the commands run once inside**. Default logging captures authentication, not process/command execution — the same blind spot as Mission 2. Everything came over the gateway `10.50.0.1` using **NTLM**, not Kerberos.
+**What my monitoring did and did not cover.** Sentinel recorded the anonymous access, the failed logons and the successful logon. I also verified that **process-creation auditing (Event 4688) is enabled** on this workstation and has been since Mission 2: querying `SecurityEvent | where EventID == 4688` returns the host's process activity, and the `svc_deploy` RDP session on 29-10 appears in it (e.g. `explorer.exe` and the usual first-logon processes at ~17:10 UTC). So process and command execution on the host **is** visible — there is no logging blind spot here. The real limit of my view is **scope, not logging**: everything that happened on the **domain controller / SYSVOL** took place off my workstation, so it is not in my SIEM. All on-host traffic came over the gateway `10.50.0.1` using **NTLM**, not Kerberos.
 
 ---
 
@@ -145,9 +147,11 @@ Result: `WKS-L62\svc_deploy` logged on successfully, first success 29-10 ~15:52 
 | Anonymous/guest SMB access to a share | A.5.15 Access control; A.8.3 Information access restriction | Access control (NIS2 Art. 21.2.i) | Disable guest/anonymous SMB; restrict share permissions to named groups |
 | Credentials stored in a readable file | A.5.17 Authentication information; A.8.3 | Secure credential handling | Never store passwords in files; use a secrets vault |
 | GPP `cpassword` in SYSVOL (reversible) | A.8.24 Use of cryptography; A.5.17 | Cryptography (NIS2 Art. 21.2.h) | Remove all GPP cpassword (MS14-025); deploy **LAPS** for local-admin passwords |
-| SMB signing not required | A.8.20 Network security; A.8.21 Security of network services | Network security | Enforce SMB signing (required, not just enabled) |
 | Legacy privileged local account with a static secret | A.8.2 Privileged access rights; A.5.16 Identity management | Identity & access management | Remove legacy admin accounts; rotate & vault service-account secrets |
 | Employee data staged for exfiltration | A.8.12 Data leakage prevention; A.5.14 Information transfer | Incident handling & data protection | DLP + egress filtering; restrict who can read the data at rest |
+
+**Other weaknesses observed (not part of this attack chain).** One finding is worth recording even though the intrusion did not rely on it:
+- **SMB signing enabled but not required** (seen in the nmap fingerprint, §2). It was not used in this chain, but it leaves the host open to SMB relay / man-in-the-middle attacks. Fix: enforce SMB signing as **required**, not merely enabled (ISO 27001 A.8.20 / A.8.21).
 
 ---
 
@@ -156,8 +160,8 @@ Result: `WKS-L62\svc_deploy` logged on successfully, first success 29-10 ~15:52 
 The intruder had **staged employee data ready to leave the network**: `staging\employees.csv`, marked `EXFIL-TEST-MARKER-M3`. It contained **4 employee records** with columns **employee_id, full_name, email, department, salary**. (The dataset is simulated lab data — `example.com` addresses — but is analysed here as if it were a real breach.)
 
 - **What was exposed:** personal data (names, emails) plus **salary** (sensitive HR/financial data) for 4 employees.
-- **NIS2 notification duty:** report to the national CSIRT/competent authority — **early warning within 24 h**, **incident notification within 72 h**, final report within one month (NIS2 Art. 23).
-- **GDPR notification duty:** notify the supervisory authority **within 72 h** of becoming aware (Art. 33); because salary data raises the risk to individuals, notify the affected people without undue delay (Art. 34).
+- **NIS2 notification duty:** report to the national CSIRT/competent authority — **early warning within 24 h**, **incident notification within 72 h**, final report within one month (NIS2 Art. 23). *Why it applies:* these duties attach when the organisation is an **essential or important entity** in a covered sector (in scope) **and** the incident is **"significant"** — i.e. capable of causing serious operational disruption or financial loss, or of affecting other parties. Domain-wide administrative exposure plus a staged personal-data set clears the "significant" threshold.
+- **GDPR notification duty:** notify the supervisory authority **within 72 h** of becoming aware (Art. 33), **and** notify the affected people without undue delay (Art. 34). *Why Art. 34 applies:* individual notification is required only when the breach is likely to be a **high risk to people's rights and freedoms**. Here the data combines identity (name, email) with **salary** (sensitive financial data), which enables targeted phishing, fraud and social engineering — a high risk — so the individuals, not just the authority, must be told.
 - **Control that should have stopped the data leaving:** Data Leakage Prevention / egress filtering (ISO 27001 A.8.12), plus access restriction at rest (A.8.3).
 
 There is evidence of **staging** (the file was gathered and ready), but no evidence in my workstation's logs of actual **exfiltration** leaving the network.
